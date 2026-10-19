@@ -1,0 +1,16 @@
+# order-stream 依赖（Python 3.10）
+# PyFlink 与 Python 版本强绑定：apache-flink 1.18 支持 Python 3.7~3.11。
+
+# 流处理（PyFlink）
+apache-flink==1.18.1
+
+# Kafka 客户端（producer / lag 监控）
+kafka-python==2.0.2
+
+# PostgreSQL 写入
+psycopg2-binary==2.9.9
+
+# 看板与绘图
+streamlit==1.65.0
+pandas==2.3.3
+plotly==7.1.0
