@@ -1,16 +1,13 @@
-# order-stream 依赖（Python 3.10）
-# PyFlink 与 Python 版本强绑定：apache-flink 1.18 支持 Python 3.7~3.11。
+# order-stream 依赖（Python 3.10 宿主 / Python 3.12 WSL2）
+# 部署方式：Kafka/PG 用 Docker；producer/看板在 Windows 宿主机；PyFlink 作业在 WSL2(Ubuntu)。
 
-# 流处理（PyFlink）
-apache-flink==1.18.1
-
-# Kafka 客户端（producer / lag 监控）
+# ---- Windows 宿主机（producer / 看板 / lag 监控）----
 kafka-python==2.0.2
-
-# PostgreSQL 写入
 psycopg2-binary==2.9.9
-
-# 看板与绘图
 streamlit==1.65.0
 pandas==2.3.3
 plotly==7.1.0
+
+# ---- WSL2 内（PyFlink 作业，另装）----
+# 注意：PyFlink 无 Windows wheel，必须在 Linux/WSL2 安装，且版本须匹配 Java 17。
+# apache-flink==2.2.1   # Flink 2.2.1，Python 3.12 可用；Kafka connector 用 flink-sql-connector-kafka-5.0.0-2.2.jar
