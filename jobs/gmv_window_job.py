@@ -18,7 +18,7 @@ import argparse
 import os
 from pathlib import Path
 
-from pyflink.datastream import StreamExecutionEnvironment, SinkFunction
+from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.table import StreamTableEnvironment
 
 # ---------------------------------------------------------------------------
@@ -72,39 +72,57 @@ def _orders_source_ddl() -> str:
 # ---------------------------------------------------------------------------
 # 自定义 PostgreSQL Sink（避免额外引入 JDBC connector 与 postgresql jar）
 # ---------------------------------------------------------------------------
-class PostgresUpsertSink(SinkFunction):
-    """把 DataStream 里的 Row 按 upsert SQL 写入 PostgreSQL。
+def _write_to_pg(upsert_sql: str, row_to_params):
+    """返回给 DataStream.map 用的 Python 函数：把每行按 upsert SQL 写入 PG（副作用）。
 
-    :param upsert_sql: 带 %s 占位符的 INSERT ... ON CONFLICT ... SQL
-    :param row_to_params: Row -> 参数 tuple 的映射函数
+    Flink 2.x 没有 Python SinkFunction 机制，JDBC connector 也未发布 2.x 版本，
+    故用 map 的副作用写 PostgreSQL；窗口结果每行触发一次，连接开销可忽略。
     """
 
-    def __init__(self, upsert_sql: str, row_to_params):
-        self.upsert_sql = upsert_sql
-        self.row_to_params = row_to_params
-        self.conn = None
-
-    def open(self, runtime_context):
+    def _fn(row):
         import psycopg2
 
-        self.conn = psycopg2.connect(
+        conn = psycopg2.connect(
             host=PG_HOST, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD
         )
-        self.conn.autocommit = True
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(upsert_sql, row_to_params(row))
+        finally:
+            conn.close()
+        return row
 
-    def invoke(self, value, context):
-        with self.conn.cursor() as cur:
-            cur.execute(self.upsert_sql, self.row_to_params(value))
-
-    def close(self):
-        if self.conn is not None:
-            self.conn.close()
+    return _fn
 
 
-def _sink(table, upsert_sql: str, row_to_params) -> None:
-    """Table -> DataStream -> 自定义 sink。"""
-    ds = table.to_data_stream()
-    ds.add_sink(PostgresUpsertSink(upsert_sql, row_to_params))
+def _changelog_write_to_pg(upsert_sql: str, row_to_params):
+    """用于 retract/upsert 流（如 Top-N 的 ROW_NUMBER）：只写 INSERT/UPDATE_AFTER。"""
+    from pyflink.common import RowKind
+
+    writer = _write_to_pg(upsert_sql, row_to_params)
+
+    def _fn(row):
+        if row.get_row_kind() in (RowKind.INSERT, RowKind.UPDATE_AFTER):
+            writer(row)
+        return row
+
+    return _fn
+
+
+def _sink(t_env, table, upsert_sql: str, row_to_params, changelog: bool = False) -> None:
+    """Table -> DataStream -> map(写 PG) -> print(兜底 sink 触发执行)。
+
+    注意：Flink 2.x 里 to_data_stream 移到 TableEnvironment 上（不再是 Table 方法）；
+    Top-N（ROW_NUMBER）产生 retract 流，需用 to_changelog_stream 并过滤 RowKind。
+    """
+    if changelog:
+        ds = t_env.to_changelog_stream(table)
+        fn = _changelog_write_to_pg(upsert_sql, row_to_params)
+    else:
+        ds = t_env.to_data_stream(table)
+        fn = _write_to_pg(upsert_sql, row_to_params)
+    ds.map(fn).print()
 
 
 def main() -> None:
@@ -114,9 +132,12 @@ def main() -> None:
 
     env = StreamExecutionEnvironment.get_execution_environment()
     _add_kafka_jar(env)
+    env.set_parallelism(3)  # 与 Kafka 3 分区对齐，避免默认 16 并行撑爆网络缓冲内存
     t_env = StreamTableEnvironment.create(env)
+    print("STEP1: env 就绪", flush=True)
 
     t_env.execute_sql(_orders_source_ddl())
+    print("STEP2: Kafka source DDL 执行完", flush=True)
 
     # ---- 1) 整体分钟级：订单数 / GMV / 客单价 ----
     minutely = t_env.sql_query(f"""
@@ -130,7 +151,7 @@ def main() -> None:
         GROUP BY TUMBLE(event_time, INTERVAL '{WINDOW_SECONDS}' SECOND)
     """)
     _sink(
-        minutely,
+        t_env, minutely,
         """
         INSERT INTO minutely_metrics (window_start, window_end, order_cnt, gmv, avg_order_value)
         VALUES (%s, %s, %s, %s, %s)
@@ -152,7 +173,7 @@ def main() -> None:
         GROUP BY TUMBLE(event_time, INTERVAL '{WINDOW_SECONDS}' SECOND), province
     """)
     _sink(
-        province,
+        t_env, province,
         """
         INSERT INTO province_metrics (window_start, province, order_cnt, gmv)
         VALUES (%s, %s, %s, %s)
@@ -178,16 +199,19 @@ def main() -> None:
         ) WHERE rn <= 5
     """)
     _sink(
-        top_items,
+        t_env, top_items,
         """
         INSERT INTO top_items (window_start, item_id, total_amount)
         VALUES (%s, %s, %s)
         ON CONFLICT (window_start, item_id) DO UPDATE SET total_amount = EXCLUDED.total_amount
         """,
         lambda r: (r[0], r[1], r[2]),
+        changelog=True,
     )
 
+    print("STEP3: 提交作业", flush=True)
     env.execute("gmv-window-job")
+    print("STEP4: 作业执行返回", flush=True)
 
 
 if __name__ == "__main__":
